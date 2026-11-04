@@ -1,5 +1,5 @@
 {
-  "name": "bluewave",
+  "name": "blue-wave",
   "version": "1.0.0",
   "description": "",
   "main": "index.js",
@@ -7,7 +7,9 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "build:single": "node scripts/make-artifact.mjs"
+    "build:single": "node scripts/make-artifact.mjs",
+    "prebuild": "node scripts/fetch-models.mjs",
+    "fetch-models": "node scripts/fetch-models.mjs"
   },
   "keywords": [],
   "author": "",

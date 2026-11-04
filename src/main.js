@@ -1,10 +1,12 @@
-// Bluewave — real-time spectral ocean in a water column.
+// Blue Wave — real-time spectral ocean in a water column.
 // Surface: sum of up to 64 Gerstner waves sampled from a fetch-limited JONSWAP
 // spectrum (wind sea) plus a narrow-band swell and an optional travelling
 // rogue crest. Shading: sky reflection with Fresnel, GGX sun glint, crest
 // subsurface scattering, Jacobian foam, procedural capillary ripples.
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { createWildlife, SPECIES, ICONS } from './wildlife.js';
 
 const MAX_WAVES = 64;
 const G = 9.81;
@@ -13,23 +15,29 @@ const TAU = Math.PI * 2;
 
 // ---------------------------------------------------------------- params
 const PRESETS = {
-  calm:     { windKn: 6,  fetchKm: 3,   spread: 40, chop: 0.6,  foam: 0.3,  swellH: 0.12, swellLen: 30,  size: 30,  depth: 10 },
-  moderate: { windKn: 12, fetchKm: 10,  spread: 30, chop: 0.85, foam: 0.55, swellH: 0.25, swellLen: 38,  size: 40,  depth: 14 },
-  fresh:    { windKn: 22, fetchKm: 40,  spread: 26, chop: 1.0,  foam: 0.75, swellH: 0.8,  swellLen: 70,  size: 80,  depth: 26 },
-  storm:    { windKn: 40, fetchKm: 200, spread: 22, chop: 1.15, foam: 0.95, swellH: 2.4,  swellLen: 170, size: 190, depth: 60 },
+  calm:     { windKn: 10, fetchKm: 8,   spread: 36, chop: 0.7,  foam: 0.35, swellH: 0.6,  swellLen: 40,  size: 36,  depth: 12 },
+  moderate: { windKn: 20, fetchKm: 30,  spread: 28, chop: 0.95, foam: 0.6,  swellH: 2.6,  swellLen: 34,  size: 44,  depth: 15 },
+  fresh:    { windKn: 28, fetchKm: 60,  spread: 26, chop: 1.05, foam: 0.75, swellH: 2.2,  swellLen: 75,  size: 80,  depth: 26 },
+  storm:    { windKn: 40, fetchKm: 200, spread: 22, chop: 1.15, foam: 0.95, swellH: 3.5,  swellLen: 170, size: 190, depth: 60 },
 };
 
 const params = {
   view: 'column',
   preset: 'moderate',
-  windKn: 12, windFrom: 90, fetchKm: 10, spread: 30,
-  swellH: 0.25, swellLen: 38, swellFrom: 215,
-  chop: 0.85, ripple: 0.6, foam: 0.55,
-  rogueH: 6,
+  windKn: 20, windFrom: 90, fetchKm: 30, spread: 28,
+  swellH: 2.6, swellLen: 34, swellFrom: 215,
+  chop: 0.95, ripple: 0.6, foam: 0.6,
+  rogueH: 8,
   hour: 14.5, bearing: 0, exposure: 1.0,
-  deep: '#02283a', scatter: '#1fa3a8', clarity: 0.4, glow: 0.8,
-  size: 40, depth: 14, grid: true,
+  deep: '#02283a', scatter: '#1fa3a8', clarity: 0.62, glow: 0.8,
+  size: 44, depth: 15, grid: true,
   rate: 1, paused: false, seed: 1,
+  tab: 'sea',
+};
+const wild = {
+  enabled: true, activity: 0.8, scale: 1, absorb: 1, amount: 1,
+  on: Object.fromEntries(SPECIES.map((d) => [d.id, true])),
+  n: Object.fromEntries(SPECIES.map((d) => [d.id, d.def])),
 };
 
 // ---------------------------------------------------------------- renderer
@@ -84,7 +92,14 @@ const U = {
   uGridMinor: { value: 1 },
   uGridOn: { value: 1 },
   uBg: { value: BG.clone() },
+  uSurfAlpha: { value: 0.6 },
+  uWaterCol: { value: new THREE.Color() },
 };
+
+// lights for the textured animal models
+const hemi = new THREE.HemisphereLight(0xbfd8ff, 0x0b2a3a, 1.2);
+const sunLight = new THREE.DirectionalLight(0xffffff, 2.5);
+scene.add(hemi, sunLight, sunLight.target);
 
 // ---------------------------------------------------------------- GLSL
 const COMMON = /* glsl */`
@@ -214,6 +229,7 @@ uniform float uSSS;
 uniform float uHs;
 uniform float uFog;
 uniform vec2 uWindDir;
+uniform float uSurfAlpha;
 varying vec2 vP;
 varying vec3 vWorld;
 varying float vH;
@@ -279,11 +295,22 @@ void main() {
   vec3 foamCol = vec3(0.9, 0.94, 0.95) * (amb * 0.75 + uSunColor * (NdL * 0.55 + 0.1) * sunVis);
   col = mix(col, foamCol, clamp(foam, 0.0, 1.0));
 
+  // see-through water: transmission falls with Fresnel and foam
+  float alpha = mix(uSurfAlpha, 1.0, clamp(F * 1.6 + foam * 1.2 + spec.r * 0.05, 0.0, 1.0));
+  if (!gl_FrontFacing && uOpen > 0.5) discard;
+  if (!gl_FrontFacing) {
+    // seen from below through the glass: bright, milky underside
+    col = uScatter * (amb * 0.45 + uSunColor * 0.3 * sunVis) + uDeep * 0.08 + foamCol * foam * 0.4;
+    alpha = 0.82;
+  }
   if (uOpen > 0.5) {
     vec3 fogc = skyColor(normalize(vec3(-V.x, 0.02, -V.z)), 0.0);
-    col = mix(col, fogc, 1.0 - exp(-dist * uFog));
+    float fg = 1.0 - exp(-dist * uFog);
+    col = mix(col, fogc, fg);
+    alpha = mix(alpha, 1.0, smoothstep(0.0, 0.5, fg) );
+    alpha = mix(alpha, 1.0, smoothstep(22.0, 70.0, dist));
   }
-  gl_FragColor = vec4(col, 1.0);
+  gl_FragColor = vec4(col, alpha);
   #include <tonemapping_fragment>
   #include <colorspace_fragment>
 }
@@ -321,11 +348,14 @@ uniform float uAbsorb;
 uniform float uGridMinor;
 uniform float uGridOn;
 uniform float uDepth;
+uniform float uSide;
 varying vec3 vWorld;
 varying float vSurf;
 varying float vU;
 varying vec3 vN;
 void main() {
+  vec3 Vw = normalize(cameraPosition - vWorld);
+  if (dot(vN, Vw) * uSide < 0.0) discard;
   float below = max(vSurf - vWorld.y, 0.0);
   vec3 L = normalize(uSunDir);
   float sunVis = smoothstep(-0.03, 0.06, L.y);
@@ -365,7 +395,11 @@ void main() {
   // darker toward the floor
   col *= mix(0.55, 1.0, smoothstep(-uDepth, -uDepth * 0.4, vWorld.y));
 
-  gl_FragColor = vec4(col, 1.0);
+  // glass: clear near the surface, denser with depth; far walls seen from inside are darker
+  float alpha = mix(0.3, 0.82, 1.0 - t) + 0.45 * exp(-below * 6.0);
+  if (uGridOn > 0.5) alpha += 0.12;
+  if (uSide < 0.0) { col *= 0.75; alpha = 0.9; }
+  gl_FragColor = vec4(col, clamp(alpha, 0.0, 1.0));
   #include <tonemapping_fragment>
   #include <colorspace_fragment>
 }
@@ -428,8 +462,24 @@ void main() {
 `;
 
 // ---------------------------------------------------------------- materials
-const surfaceMat = new THREE.ShaderMaterial({ uniforms: U, vertexShader: SURFACE_VERT, fragmentShader: SURFACE_FRAG, side: THREE.DoubleSide });
-const wallMat = new THREE.ShaderMaterial({ uniforms: U, vertexShader: WALL_VERT, fragmentShader: WALL_FRAG, side: THREE.DoubleSide });
+const surfaceMat = new THREE.ShaderMaterial({ uniforms: U, vertexShader: SURFACE_VERT, fragmentShader: SURFACE_FRAG, side: THREE.DoubleSide, transparent: true });
+const wallMat = (side) => new THREE.ShaderMaterial({ uniforms: { ...U, uSide: { value: side } }, vertexShader: WALL_VERT, fragmentShader: WALL_FRAG, side: THREE.DoubleSide, transparent: true, depthWrite: false });
+const SEABED_FRAG = /* glsl */`
+${COMMON}
+uniform vec3 uDeep;
+uniform vec3 uScatter;
+varying vec3 vWorld;
+void main() {
+  vec3 amb = skyColor(vec3(0.0, 1.0, 0.0), 0.0);
+  float sunVis = smoothstep(-0.03, 0.06, uSunDir.y);
+  float caust = pow(fbm(vWorld.xz * 0.35 + vec2(uTime * 0.12, uTime * 0.08)), 3.0) * 2.5;
+  vec3 col = uDeep * (amb * 0.16 + 0.012) + uScatter * uSunColor * caust * 0.02 * sunVis * (1.0 - uOpen);
+  gl_FragColor = vec4(col, 1.0);
+  #include <tonemapping_fragment>
+  #include <colorspace_fragment>
+}
+`;
+const seabedMat = new THREE.ShaderMaterial({ uniforms: U, vertexShader: FLOOR_VERT, fragmentShader: SEABED_FRAG });
 const floorMat = new THREE.ShaderMaterial({ uniforms: U, vertexShader: FLOOR_VERT, fragmentShader: FLOOR_FRAG });
 const skyMat = new THREE.ShaderMaterial({ uniforms: U, vertexShader: SKY_VERT, fragmentShader: SKY_FRAG, side: THREE.BackSide, depthWrite: false });
 
@@ -502,7 +552,13 @@ function wallGeometry(half, n) {
 
 const COLUMN_SEGS = 320;
 const columnSurface = new THREE.Mesh(new THREE.BufferGeometry(), surfaceMat);
-const walls = new THREE.Mesh(new THREE.BufferGeometry(), wallMat);
+const walls = new THREE.Mesh(new THREE.BufferGeometry(), wallMat(1));
+const wallsBack = new THREE.Mesh(walls.geometry, wallMat(-1));
+const seabed = new THREE.Mesh(new THREE.PlaneGeometry(1, 1).rotateX(-Math.PI / 2), seabedMat);
+wallsBack.frustumCulled = seabed.frustumCulled = false;
+wallsBack.renderOrder = 1;
+columnSurface.renderOrder = 2;
+walls.renderOrder = 3;
 const floor = new THREE.Mesh(new THREE.PlaneGeometry(4000, 4000).rotateX(-Math.PI / 2), floorMat);
 columnSurface.frustumCulled = walls.frustumCulled = false;
 
@@ -513,11 +569,12 @@ const openSurface = new THREE.Mesh(
   surfaceMat,
 );
 openSurface.frustumCulled = false;
+openSurface.renderOrder = 2;
 const sky = new THREE.Mesh(new THREE.SphereGeometry(10000, 48, 24), skyMat);
 sky.frustumCulled = false;
 sky.renderOrder = -1;
 
-scene.add(columnSurface, walls, floor, openSurface, sky);
+scene.add(columnSurface, walls, wallsBack, seabed, floor, openSurface, sky);
 
 function gridStep(size) { return size <= 60 ? 1 : size <= 140 ? 2 : 5; }
 
@@ -527,16 +584,23 @@ function rebuildColumn() {
   walls.geometry.dispose();
   columnSurface.geometry = gridGeometry(COLUMN_SEGS, (u) => u * half);
   walls.geometry = wallGeometry(half, COLUMN_SEGS);
+  wallsBack.geometry = walls.geometry;
   floor.position.y = -params.depth - 0.002;
+  placeSeabed();
   U.uSpacing.value = params.size / COLUMN_SEGS;
   U.uHalf.value = half;
   U.uDepth.value = params.depth;
   U.uGridMinor.value = gridStep(params.size);
 }
 
+function placeSeabed() {
+  if (params.view === 'open') { seabed.scale.set(8000, 1, 8000); seabed.position.y = -45; }
+  else { seabed.scale.set(params.size, 1, params.size); seabed.position.y = -params.depth + 0.01; }
+}
 function applyView() {
   const open = params.view === 'open';
-  columnSurface.visible = walls.visible = floor.visible = !open;
+  columnSurface.visible = walls.visible = wallsBack.visible = floor.visible = !open;
+  placeSeabed();
   openSurface.visible = sky.visible = open;
   U.uOpen.value = open ? 1 : 0;
   document.body.classList.toggle('open-water', open);
@@ -544,7 +608,6 @@ function applyView() {
   controls.maxPolarAngle = open ? Math.PI / 2 - 0.03 : Math.PI * 0.5;
   controls.minDistance = open ? 4 : params.size * 0.35;
   controls.maxDistance = open ? 900 : params.size * 7;
-  document.querySelector('.spec .eyebrow').textContent = open ? 'Study 01 · open water' : 'Study 01 · water column';
 }
 
 // ---------------------------------------------------------------- spectrum
@@ -627,6 +690,24 @@ function buildSea(resetPhase) {
   U.uWindDir.value.set(Math.sin(travel), -Math.cos(travel));
 }
 
+// CPU copy of the surface height (horizontal displacement ignored) for animals
+function seaHeight(x, z) {
+  const WA = U.uWA.value, WB = U.uWB.value;
+  let h = 0;
+  for (let i = 0; i < stats.count; i++) {
+    const A = WA[i * 4 + 2];
+    if (A === 0) continue;
+    h += A * Math.sin(WB[i * 4] * (WA[i * 4] * x + WA[i * 4 + 1] * z) - WB[i * 4 + 1]);
+  }
+  const r = U.uRogue.value, r2 = U.uRogue2.value;
+  if (r2.w > 0.5 && r.w > 0) {
+    const sd = x * r.x + z * r.y - r.z, pe = -x * r.y + z * r.x;
+    const sig = sd > 0 ? r2.x * 0.6 : r2.x * 1.3;
+    h += r.w * Math.exp((-0.5 * sd * sd) / (sig * sig)) * Math.exp((-0.5 * pe * pe) / (r2.y * r2.y));
+  }
+  return h;
+}
+
 // ---------------------------------------------------------------- rogue wave
 const rogue = { active: false, pos: 0, end: 0, c: 1, ramp: 1 };
 function sendRogue() {
@@ -673,6 +754,18 @@ function applyLight() {
   const warm = new THREE.Color(1.0, 0.42, 0.16), white = new THREE.Color(1.0, 0.95, 0.88);
   U.uSunColor.value.copy(warm).lerp(white, warmth).multiplyScalar(0.1 + 3.2 * day);
   renderer.toneMappingExposure = params.exposure;
+  sunLight.position.copy(U.uSunDir.value).multiplyScalar(100);
+  sunLight.color.copy(warm).lerp(white, warmth);
+  sunLight.intensity = 0.05 + 2.6 * day;
+  hemi.intensity = 0.15 + 1.1 * day;
+  hemi.color.setRGB(0.55 + 0.2 * warmth, 0.62 + 0.15 * warmth, 0.75);
+  updateWaterCol();
+}
+function updateWaterCol() {
+  const s = U.uSunDir.value.y;
+  const day = THREE.MathUtils.smoothstep(s, -0.06, 0.25);
+  U.uWaterCol.value.copy(U.uDeep.value).multiplyScalar(0.03 + 0.32 * day)
+    .add(U.uScatter.value.clone().multiplyScalar(0.05 * day));
 }
 function applyWater() {
   U.uDeep.value.set(params.deep);
@@ -682,17 +775,20 @@ function applyWater() {
   U.uSSS.value = params.glow;
   U.uAbsorb.value = THREE.MathUtils.lerp(0.6, 0.03, params.clarity) * (40 / Math.max(params.size, 20)) ** 0.5;
   U.uGridOn.value = params.grid ? 1 : 0;
+  U.uSurfAlpha.value = THREE.MathUtils.lerp(0.86, 0.38, params.clarity);
+  wild.absorb = THREE.MathUtils.lerp(1.8, 0.45, params.clarity);
+  updateWaterCol();
 }
 
 // ---------------------------------------------------------------- camera
-const DEFAULT_DIR = new THREE.Vector3(0.66, 0.5, 0.56).normalize();
+const DEFAULT_DIR = new THREE.Vector3(0.7, 0.4, 0.6).normalize();
 function resetCamera() {
   if (params.view === 'open') {
     controls.target.set(0, 1.5, 0);
     camera.position.set(-38, 11, 52);
   } else {
     controls.target.set(0, -params.depth * 0.32, 0);
-    camera.position.copy(controls.target).addScaledVector(DEFAULT_DIR, params.size * 2.6 * (camera.aspect < 0.8 ? 1.45 : 1));
+    camera.position.copy(controls.target).addScaledVector(DEFAULT_DIR, params.size * 2.35 * (camera.aspect < 0.8 ? 1.45 : 1));
   }
   controls.update();
 }
@@ -709,66 +805,44 @@ const COMPASS = ['N', 'NNE', 'NE', 'ENE', 'E', 'ESE', 'SE', 'SSE', 'S', 'SSW', '
 const compass = (deg) => COMPASS[Math.round((((deg % 360) + 360) % 360) / 22.5) % 16];
 const fmtClock = (h) => { const hh = Math.floor(h), mm = Math.round((h - hh) * 60); return `${String(hh).padStart(2, '0')}:${String(mm % 60).padStart(2, '0')}`; };
 function douglas(hs) {
-  if (hs < 0.02) return 'glassy calm';
-  if (hs < 0.1) return 'rippled sea';
-  if (hs < 0.5) return 'smooth sea';
-  if (hs < 1.25) return 'slight sea';
-  if (hs < 2.5) return 'moderate sea';
-  if (hs < 4) return 'rough sea';
-  if (hs < 6) return 'very rough sea';
-  if (hs < 9) return 'high sea';
-  if (hs < 14) return 'very high sea';
-  return 'phenomenal sea';
+  if (hs < 0.02) return 'Glassy calm';
+  if (hs < 0.1) return 'Rippled sea';
+  if (hs < 0.5) return 'Smooth sea';
+  if (hs < 1.25) return 'Slight sea';
+  if (hs < 2.5) return 'Moderate sea';
+  if (hs < 4) return 'Rough sea';
+  if (hs < 6) return 'Very rough sea';
+  if (hs < 9) return 'High sea';
+  if (hs < 14) return 'Very high sea';
+  return 'Phenomenal sea';
 }
 function updateHud() {
-  $('r-state').textContent = douglas(stats.hs);
-  $('r-hs').textContent = `${stats.hs.toFixed(2)} m`;
-  $('r-tp').textContent = `${stats.tp.toFixed(1)} s`;
-  $('r-lp').textContent = `${stats.lp < 10 ? stats.lp.toFixed(1) : Math.round(stats.lp)} m`;
-  $('r-st').textContent = stats.hs > 0.005 ? `1/${Math.round(stats.lp / stats.hs)}` : '—';
-  $('r-wind').textContent = params.windKn < 0.5 ? 'calm' : `${Math.round(params.windKn)} kn from ${compass(params.windFrom)}`;
-  const { el } = sunAngles();
-  $('r-light').textContent = `${fmtClock(params.hour)} · sun ${Math.round(el)}°`;
-  const g = gridStep(params.size);
-  $('r-grid').textContent = params.view === 'open' ? 'off in open water' : `${g} m · heavy line ${g * 5} m`;
-  $('r-spec').textContent = `JONSWAP ${N_WIND} + swell ${N_SWELL}`;
-  $('r-seed').textContent = String(params.seed);
-  $('r-engine').textContent = `WebGL2 · three r${THREE.REVISION}`;
+  const wind = params.windKn < 0.5 ? 'no wind' : `${Math.round(params.windKn)} kn wind`;
+  $('r-summary').textContent = `${douglas(stats.hs)}, ${stats.hs.toFixed(1)} m waves, ${wind}${params.paused ? ', paused' : ''}`;
 }
 
-// ---------------------------------------------------------------- panel
-const controlsRoot = $('controls');
+// ---------------------------------------------------------------- controls
 const sync = [];
+const syncAll = () => sync.forEach((f) => f());
 function el(tag, cls, text) { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; }
-function group(title, note) {
-  const s = el('section', 'grp');
-  s.append(el('h3', null, title));
-  if (note) s.append(el('p', 'note', note));
-  controlsRoot.append(s);
-  return s;
-}
-function slider(parent, key, label, min, max, step, fmt, onInput) {
+function slider(parent, key, label, min, max, step, fmt, onInput, obj = params) {
   const row = el('div', 'row');
   const id = `c-${key}`;
   const lab = el('label', null, label); lab.htmlFor = id;
   const out = el('output'); out.htmlFor = id;
   const inp = el('input'); inp.type = 'range'; inp.id = id; inp.min = min; inp.max = max; inp.step = step;
   const paint = () => {
-    inp.value = params[key];
-    out.textContent = fmt(params[key]);
-    inp.style.setProperty('--p', `${((params[key] - min) / (max - min)) * 100}%`);
+    inp.value = obj[key];
+    out.textContent = fmt(obj[key]);
+    inp.style.setProperty('--p', `${((obj[key] - min) / (max - min)) * 100}%`);
   };
-  inp.addEventListener('input', () => { params[key] = parseFloat(inp.value); paint(); onInput(); });
+  inp.addEventListener('input', () => { obj[key] = parseFloat(inp.value); paint(); onInput(); });
   row.append(lab, out, inp);
   parent.append(row);
   sync.push(paint);
   paint();
 }
-function segmented(parent, key, label, options, onPick, extra) {
-  const wrap = el('div');
-  wrap.style.display = 'grid'; wrap.style.gap = '6px';
-  const head = el('div', 'seg-label'); head.append(el('span', null, label));
-  const hint = el('span'); head.append(hint);
+function segmented(parent, key, label, options, onPick) {
   const seg = el('div', 'seg'); seg.setAttribute('role', 'group'); seg.setAttribute('aria-label', label);
   const btns = options.map(([value, text]) => {
     const b = el('button', null, text); b.type = 'button'; b.id = `c-${key}-${value}`;
@@ -776,44 +850,34 @@ function segmented(parent, key, label, options, onPick, extra) {
     seg.append(b);
     return [value, b];
   });
-  const paint = () => { btns.forEach(([v, b]) => b.setAttribute('aria-pressed', String(params[key] === v))); hint.textContent = extra ? extra() : ''; };
-  wrap.append(head, seg);
-  parent.append(wrap);
+  const paint = () => btns.forEach(([v, b]) => b.setAttribute('aria-pressed', String(params[key] === v)));
+  parent.append(seg);
   sync.push(paint);
   paint();
 }
-function toggle(parent, key, label, onFlip) {
+function toggle(parent, key, label, onFlip, obj = params) {
   const b = el('button', 'toggle'); b.type = 'button'; b.id = `c-${key}`;
   b.append(el('span', null, label), el('i'));
-  const paint = () => b.setAttribute('aria-pressed', String(!!params[key]));
-  b.addEventListener('click', () => { params[key] = !params[key]; paint(); onFlip(); });
+  const paint = () => b.setAttribute('aria-pressed', String(!!obj[key]));
+  b.addEventListener('click', () => { obj[key] = !obj[key]; paint(); onFlip(); });
   parent.append(b);
   sync.push(paint);
   paint();
 }
-function swatch(parent, key, label, onInput) {
-  const l = el('label', 'swatch');
-  const inp = el('input'); inp.type = 'color'; inp.id = `c-${key}`;
-  const small = el('small');
-  const paint = () => { inp.value = params[key]; small.textContent = params[key].replace('#', ''); };
-  inp.addEventListener('input', () => { params[key] = inp.value; paint(); onInput(); });
-  l.append(inp, el('span', null, label), small);
-  parent.append(l);
-  sync.push(paint);
-  paint();
-}
-function button(parent, label, key, onClick, primary) {
-  const b = el('button', primary ? 'btn primary' : 'btn'); b.type = 'button';
-  b.append(el('span', null, label));
-  if (key) b.append(el('kbd', null, key));
+function button(parent, label, onClick, cls = '') {
+  const b = el('button', `btn ${cls}`.trim(), label); b.type = 'button';
   b.addEventListener('click', onClick);
   parent.append(b);
   return b;
 }
-const syncAll = () => sync.forEach((f) => f());
 
-const seaChanged = () => { params.preset = 'custom'; buildSea(false); syncPresetOnly(); updateHud(); };
-let syncPresetOnly = () => {};
+const WATERS = [
+  { id: 'ocean', label: 'Ocean', deep: '#02283a', scatter: '#1fa3a8', clarity: 0.62 },
+  { id: 'tropical', label: 'Tropical', deep: '#00384a', scatter: '#2fd6c4', clarity: 0.88 },
+  { id: 'atlantic', label: 'Atlantic', deep: '#0b1d27', scatter: '#4a8a8e', clarity: 0.32 },
+  { id: 'midnight', label: 'Midnight', deep: '#020b1d', scatter: '#2160c4', clarity: 0.5 },
+];
+params.water = 'ocean';
 
 function applyPreset(name) {
   const p = PRESETS[name];
@@ -827,90 +891,105 @@ function applyPreset(name) {
   if (params.view === 'column') rescaleCamera(oldSize);
   syncAll();
 }
+const seaChanged = () => { params.preset = 'custom'; buildSea(false); syncAll(); updateHud(); };
 
-function buildPanel() {
-  const v = group('View');
-  segmented(v, 'view', 'Scene', [['column', 'Water column'], ['open', 'Open sea']], () => { applyView(); resetCamera(); updateHud(); });
-
-  const s = group('Wind sea');
-  segmented(s, 'preset', 'Sea state', [['calm', 'Calm'], ['moderate', 'Moderate'], ['fresh', 'Fresh'], ['storm', 'Storm']], (n) => applyPreset(n), () => (params.preset === 'custom' ? 'custom' : ''));
-  syncPresetOnly = () => sync[1]();
-  slider(s, 'windKn', 'Wind speed', 0, 50, 0.5, (x) => `${x.toFixed(1)} kn`, seaChanged);
-  slider(s, 'windFrom', 'Wind from', 0, 359, 1, (x) => `${compass(x)} ${Math.round(x)}°`, seaChanged);
-  slider(s, 'fetchKm', 'Fetch', 1, 300, 1, (x) => `${Math.round(x)} km`, seaChanged);
-  slider(s, 'spread', 'Directional spread', 5, 80, 1, (x) => `${Math.round(x)}°`, seaChanged);
-
-  const w = group('Swell', 'A long, narrow-band sea from a distant storm, laid over the wind sea.');
-  slider(w, 'swellH', 'Swell height', 0, 8, 0.05, (x) => `${x.toFixed(2)} m`, seaChanged);
-  slider(w, 'swellLen', 'Swell wavelength', 10, 250, 1, (x) => `${Math.round(x)} m`, seaChanged);
-  slider(w, 'swellFrom', 'Swell from', 0, 359, 1, (x) => `${compass(x)} ${Math.round(x)}°`, seaChanged);
-
-  const sh = group('Shape', 'Choppiness pulls the surface toward each crest, sharpening peaks and widening troughs.');
-  slider(sh, 'chop', 'Choppiness', 0, 1.5, 0.01, (x) => x.toFixed(2), () => buildSea(false));
-  slider(sh, 'ripple', 'Capillary ripples', 0, 1, 0.01, (x) => x.toFixed(2), applyWater);
-  slider(sh, 'foam', 'Whitecaps', 0, 1, 0.01, (x) => x.toFixed(2), applyWater);
-
-  const r = group('Rogue wave', 'A single travelling crest, sent along the wind direction.');
-  slider(r, 'rogueH', 'Crest height', 1, 30, 0.5, (x) => `${x.toFixed(1)} m`, () => {});
-  const rb = el('div', 'btns'); r.append(rb);
-  button(rb, 'Send rogue wave', 'W', sendRogue, true);
-
-  const l = group('Light');
-  slider(l, 'hour', 'Time of day', 5.5, 19.5, 0.05, (x) => `${fmtClock(x)} · sun ${Math.round(sunElevation(x))}°`, () => { applyLight(); updateHud(); });
-  slider(l, 'bearing', 'Sun bearing', -180, 180, 1, (x) => `${x > 0 ? '+' : ''}${Math.round(x)}°`, applyLight);
-  slider(l, 'exposure', 'Exposure', 0.3, 2.2, 0.01, (x) => x.toFixed(2), applyLight);
-
-  const c = group('Water');
-  const sw = el('div', 'swatches'); c.append(sw);
-  swatch(sw, 'deep', 'Deep', applyWater);
-  swatch(sw, 'scatter', 'Scatter', applyWater);
-  slider(c, 'glow', 'Crest glow', 0, 2, 0.01, (x) => x.toFixed(2), applyWater);
-  slider(c, 'clarity', 'Clarity', 0, 1, 0.01, (x) => x.toFixed(2), applyWater);
-
-  const col = group('Column');
-  slider(col, 'size', 'Width', 20, 220, 1, (x) => `${Math.round(x)} m`, (() => {
-    let last = params.size;
-    return () => { rebuildColumn(); applyWater(); applyView(); if (params.view === 'column') rescaleCamera(last); last = params.size; updateHud(); };
-  })());
-  slider(col, 'depth', 'Depth', 3, 90, 0.5, (x) => `${x.toFixed(1)} m`, () => { rebuildColumn(); });
-  toggle(col, 'grid', 'Measurement grid', applyWater);
-
-  const t = group('Time');
-  slider(t, 'rate', 'Playback rate', 0, 2, 0.01, (x) => `${x.toFixed(2)}×`, () => {});
-  const tb = el('div', 'btns'); t.append(tb);
-  pauseBtn = button(tb, 'Pause', 'Space', togglePause);
-  button(tb, 'New sea', 'R', newSea);
+function setPopulation() {
+  for (const d of SPECIES) wild.n[d.id] = Math.max(1, Math.min(d.max, Math.round(d.def * wild.amount)));
 }
-let pauseBtn;
-function togglePause() {
-  params.paused = !params.paused;
-  pauseBtn.firstChild.textContent = params.paused ? 'Play' : 'Pause';
-  $('paused-tag').hidden = !params.paused;
+
+const panels = {};
+function buildPanels() {
+  // Sea
+  const sea = el('div', 'panel');
+  segmented(sea, 'preset', 'Sea state', [['calm', 'Calm'], ['moderate', 'Moderate'], ['fresh', 'Fresh'], ['storm', 'Storm']], (n) => applyPreset(n));
+  slider(sea, 'swellH', 'Wave height', 0, 8, 0.05, (x) => `${x.toFixed(1)} m`, seaChanged);
+  slider(sea, 'windKn', 'Wind', 0, 50, 0.5, (x) => `${Math.round(x)} kn`, seaChanged);
+  slider(sea, 'chop', 'Choppiness', 0, 1.5, 0.01, (x) => `${Math.round((x / 1.5) * 100)}%`, () => buildSea(false));
+  button(sea, 'Send a rogue wave', sendRogue, 'primary');
+  panels.sea = { title: 'Sea', node: sea };
+
+  // Wildlife
+  const life = el('div', 'panel');
+  const chips = el('div', 'chips');
+  for (const d of SPECIES) {
+    const c = el('button', 'chip'); c.type = 'button'; c.id = `c-sp-${d.id}`;
+    c.innerHTML = `<svg viewBox="0 0 24 24" aria-hidden="true">${ICONS[d.id]}</svg><span>${d.label}</span>`;
+    const paint = () => c.setAttribute('aria-pressed', String(wild.on[d.id]));
+    c.addEventListener('click', () => { wild.on[d.id] = !wild.on[d.id]; paint(); });
+    chips.append(c);
+    sync.push(paint);
+    paint();
+  }
+  life.append(chips);
+  slider(life, 'amount', 'Population', 0.25, 2.5, 0.05, (x) => (x < 0.6 ? 'Sparse' : x < 1.4 ? 'Balanced' : 'Busy'), setPopulation, wild);
+  slider(life, 'activity', 'Liveliness', 0, 3, 0.05, (x) => (x < 0.5 ? 'Calm' : x < 1.5 ? 'Natural' : 'Playful'), () => {}, wild);
+  const acts = el('div', 'actions');
+  button(acts, 'Breach', () => { wild.on.whale = true; syncAll(); wildlife.breach(); }, 'small');
+  button(acts, 'Leap', () => { wild.on.dolphin = true; syncAll(); wildlife.leap(); }, 'small');
+  button(acts, 'Fly by', () => { wild.on.pelican = true; syncAll(); wildlife.flyover(); }, 'small');
+  life.append(acts);
+  panels.life = { title: 'Wildlife', node: life };
+
+  // Light
+  const light = el('div', 'panel');
+  slider(light, 'hour', 'Time of day', 5.5, 19.5, 0.05, fmtClock, () => { applyLight(); });
+  const sw = el('div', 'swatches'); sw.setAttribute('role', 'group'); sw.setAttribute('aria-label', 'Water colour');
+  for (const w of WATERS) {
+    const b = el('button', 'swatch'); b.type = 'button'; b.id = `c-water-${w.id}`;
+    const dot = el('i'); dot.style.background = `radial-gradient(circle at 35% 30%, ${w.scatter}, ${w.deep} 75%)`;
+    b.append(dot, el('span', null, w.label));
+    const paint = () => b.setAttribute('aria-pressed', String(params.water === w.id));
+    b.addEventListener('click', () => { Object.assign(params, { water: w.id, deep: w.deep, scatter: w.scatter, clarity: w.clarity }); applyWater(); syncAll(); });
+    sw.append(b);
+    sync.push(paint);
+    paint();
+  }
+  light.append(sw);
+  slider(light, 'clarity', 'Clarity', 0, 1, 0.01, (x) => `${Math.round(x * 100)}%`, applyWater);
+  toggle(light, 'grid', 'Measurement grid', applyWater);
+  panels.light = { title: 'Light', node: light };
 }
-function newSea() {
-  params.seed += 1;
-  buildSea(true);
-  updateHud();
+
+const pop = $('pop');
+let openPanel = null;
+function showPanel(id) {
+  openPanel = openPanel === id ? null : id;
+  document.querySelectorAll('.tool').forEach((t) => t.setAttribute('aria-expanded', String(t.dataset.panel === openPanel)));
+  pop.hidden = !openPanel;
+  if (!openPanel) return;
+  $('pop-title').textContent = panels[openPanel].title;
+  $('pop-body').replaceChildren(panels[openPanel].node);
 }
+document.querySelectorAll('.tool').forEach((t) => t.addEventListener('click', () => showPanel(t.dataset.panel)));
+$('pop-close').addEventListener('click', () => showPanel(openPanel));
+renderer.domElement.addEventListener('pointerdown', () => { if (openPanel) showPanel(openPanel); });
+
+function setView(v) {
+  params.view = v;
+  $('view-column').setAttribute('aria-pressed', String(v === 'column'));
+  $('view-open').setAttribute('aria-pressed', String(v === 'open'));
+  applyView(); resetCamera(); updateHud();
+}
+$('view-column').addEventListener('click', () => setView('column'));
+$('view-open').addEventListener('click', () => setView('open'));
+
+let wildlife;
+function togglePause() { params.paused = !params.paused; updateHud(); }
+function newSea() { params.seed += 1; buildSea(true); updateHud(); }
 
 // ---------------------------------------------------------------- input
 window.addEventListener('keydown', (e) => {
   const tag = (e.target && e.target.tagName) || '';
+  if (e.key === 'Escape' && openPanel) { showPanel(openPanel); return; }
   if (tag === 'INPUT' || tag === 'TEXTAREA' || e.metaKey || e.ctrlKey || e.altKey) return;
-  if (e.code === 'Space') { e.preventDefault(); togglePause(); }
+  if (e.code === 'Space' && tag !== 'BUTTON') { e.preventDefault(); togglePause(); }
   else if (e.key === 'r' || e.key === 'R') newSea();
   else if (e.key === 'w' || e.key === 'W') sendRogue();
+  else if (e.key === 'b' || e.key === 'B') { wild.on.whale = true; syncAll(); wildlife.breach(); }
+  else if (e.key === 'l' || e.key === 'L') { wild.on.dolphin = true; syncAll(); wildlife.leap(); }
+  else if (e.key === 'p' || e.key === 'P') { wild.on.pelican = true; syncAll(); wildlife.flyover(); }
 });
 renderer.domElement.addEventListener('dblclick', resetCamera);
-
-const panel = $('panel');
-const sheetBtn = $('sheet-toggle');
-if (window.matchMedia('(max-width: 760px)').matches) panel.classList.add('collapsed');
-sheetBtn.addEventListener('click', () => {
-  panel.classList.toggle('collapsed');
-  sheetBtn.textContent = panel.classList.contains('collapsed') ? 'Controls' : 'Hide';
-});
-sheetBtn.textContent = panel.classList.contains('collapsed') ? 'Controls' : 'Hide';
 
 function resize() {
   const w = stage.clientWidth || window.innerWidth;
@@ -918,17 +997,20 @@ function resize() {
   renderer.setSize(w, h, false);
   camera.aspect = w / h;
   camera.fov = w / h < 0.8 ? 52 : 38;
-  // keep the subject centred in the space left of the docked panel
-  const shift = w > 760 ? 160 : 0;
-  if (shift) camera.setViewOffset(w, h, shift, 0, w, h); else camera.clearViewOffset();
   camera.updateProjectionMatrix();
 }
 new ResizeObserver(resize).observe(stage);
 
 // ---------------------------------------------------------------- boot
-buildPanel();
+buildPanels();
 rebuildColumn();
 buildSea(true);
+wildlife = createWildlife({
+  scene, U, common: COMMON, seaHeight, state: wild, GLTFLoader, packedModels: !!window.BLUE_WAVE_PACKED || new URLSearchParams(location.search).has('packed'),
+  getBounds: () => (params.view === 'open'
+    ? { open: true, half: 45, depth: 40 }
+    : { open: false, half: params.size / 2, depth: params.depth }),
+});
 applyLight();
 applyWater();
 applyView();
@@ -938,7 +1020,7 @@ updateHud();
 
 let lastT = performance.now();
 let simTime = 0, frames = 0, fpsAcc = 0, hudAcc = 0;
-window.__sea = { params, U, rogue, stats, get time() { return simTime; } };
+window.__sea = { params, U, rogue, stats, wild, camera, controls, get wildlife() { return wildlife; }, get time() { return simTime; } };
 renderer.setAnimationLoop(() => {
   const now = performance.now();
   const raw = Math.min((now - lastT) / 1000, 0.1);
@@ -952,15 +1034,9 @@ renderer.setAnimationLoop(() => {
     WB[i * 4 + 1] = phase[i];
   }
   updateRogue(dt);
+  wildlife.update(dt, simTime, camera, renderer);
   controls.update();
   if (params.view === 'open' && camera.position.y < 2.5) camera.position.y = 2.5;
   renderer.render(scene, camera);
 
-  frames++; fpsAcc += raw; hudAcc += raw;
-  if (fpsAcc > 0.5) { $('r-fps').textContent = `${Math.round(frames / fpsAcc)} fps`; frames = 0; fpsAcc = 0; }
-  if (hudAcc > 0.25) {
-    hudAcc = 0;
-    const s = Math.floor(simTime);
-    $('r-time').textContent = `T+${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;
-  }
 });
