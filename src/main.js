@@ -913,7 +913,7 @@ function buildPanels() {
   const chips = el('div', 'chips');
   for (const d of SPECIES) {
     const c = el('button', 'chip'); c.type = 'button'; c.id = `c-sp-${d.id}`;
-    c.innerHTML = `<svg viewBox="0 0 24 24" aria-hidden="true">${ICONS[d.id]}</svg><span>${d.label}</span>`;
+    c.innerHTML = `<img src="./icons/${d.id}.png" alt="" draggable="false" decoding="async"><span>${d.label}</span>`;
     const paint = () => c.setAttribute('aria-pressed', String(wild.on[d.id]));
     c.addEventListener('click', () => { wild.on[d.id] = !wild.on[d.id]; paint(); });
     chips.append(c);
@@ -955,14 +955,36 @@ let openPanel = null;
 function showPanel(id) {
   openPanel = openPanel === id ? null : id;
   document.querySelectorAll('.tool').forEach((t) => t.setAttribute('aria-expanded', String(t.dataset.panel === openPanel)));
-  pop.hidden = !openPanel;
+  pop.classList.toggle('open', !!openPanel);
+  pop.inert = !openPanel;
+  pop.setAttribute('aria-hidden', String(!openPanel));
+  document.body.classList.toggle('sheet-open', !!openPanel);
   if (!openPanel) return;
   $('pop-title').textContent = panels[openPanel].title;
   $('pop-body').replaceChildren(panels[openPanel].node);
+  pop.scrollTop = 0;
 }
+pop.inert = true;
 document.querySelectorAll('.tool').forEach((t) => t.addEventListener('click', () => showPanel(t.dataset.panel)));
 $('pop-close').addEventListener('click', () => showPanel(openPanel));
-renderer.domElement.addEventListener('pointerdown', () => { if (openPanel) showPanel(openPanel); });
+// tapping anywhere outside the toolbar and sheet closes the sheet
+document.addEventListener('pointerdown', (e) => { if (openPanel && !e.target.closest('.dock')) showPanel(openPanel); }, true);
+// swipe the sheet's header down to dismiss it on touch screens
+(() => {
+  let y0 = null, dy = 0;
+  const head = pop.querySelector('.pop-head');
+  head.addEventListener('touchstart', (e) => { y0 = e.touches[0].clientY; dy = 0; pop.style.transition = 'none'; }, { passive: true });
+  head.addEventListener('touchmove', (e) => {
+    if (y0 == null) return;
+    dy = Math.max(0, e.touches[0].clientY - y0);
+    pop.style.transform = `translateY(${dy}px)`;
+  }, { passive: true });
+  head.addEventListener('touchend', () => {
+    pop.style.transition = ''; pop.style.transform = '';
+    if (dy > 70 && openPanel) showPanel(openPanel);
+    y0 = null;
+  });
+})();
 
 function setView(v) {
   params.view = v;
