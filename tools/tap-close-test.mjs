@@ -1,0 +1,13 @@
+import puppeteer from 'puppeteer-core';
+const b = await puppeteer.launch({ executablePath: '/usr/bin/google-chrome', headless: 'new', args: ['--no-sandbox', '--use-angle=swiftshader', '--enable-unsafe-swiftshader'] });
+const p = await b.newPage();
+await p.setViewport({ width: 390, height: 844, isMobile: true, hasTouch: true });
+await p.goto(process.argv[2], { waitUntil: 'networkidle0' });
+await p.tap('[data-panel=sea]'); await new Promise((r) => setTimeout(r, 600));
+console.log('open:', await p.$eval('#pop', (e) => e.classList.contains('open')));
+await p.touchscreen.tap(195, 180); await new Promise((r) => setTimeout(r, 600));
+console.log('closed by ocean tap:', await p.$eval('#pop', (e) => !e.classList.contains('open')));
+await p.tap('[data-panel=light]'); await new Promise((r) => setTimeout(r, 600));
+await p.tap('#c-water-tropical'); await new Promise((r) => setTimeout(r, 300));
+console.log('stays open on inner tap:', await p.$eval('#pop', (e) => e.classList.contains('open')));
+await b.close();
