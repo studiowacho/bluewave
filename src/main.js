@@ -913,7 +913,7 @@ function buildPanels() {
   const chips = el('div', 'chips');
   for (const d of SPECIES) {
     const c = el('button', 'chip'); c.type = 'button'; c.id = `c-sp-${d.id}`;
-    c.innerHTML = `<svg viewBox="0 0 24 24" aria-hidden="true">${ICONS[d.id]}</svg><span>${d.label}</span>`;
+    c.innerHTML = `<img src="./icons/${d.id}.png" alt="" draggable="false" decoding="async"><span>${d.label}</span>`;
     const paint = () => c.setAttribute('aria-pressed', String(wild.on[d.id]));
     c.addEventListener('click', () => { wild.on[d.id] = !wild.on[d.id]; paint(); });
     chips.append(c);
@@ -967,7 +967,8 @@ function showPanel(id) {
 pop.inert = true;
 document.querySelectorAll('.tool').forEach((t) => t.addEventListener('click', () => showPanel(t.dataset.panel)));
 $('pop-close').addEventListener('click', () => showPanel(openPanel));
-renderer.domElement.addEventListener('pointerdown', () => { if (openPanel) showPanel(openPanel); });
+// tapping anywhere outside the toolbar and sheet closes the sheet
+document.addEventListener('pointerdown', (e) => { if (openPanel && !e.target.closest('.dock')) showPanel(openPanel); }, true);
 // swipe the sheet's header down to dismiss it on touch screens
 (() => {
   let y0 = null, dy = 0;
