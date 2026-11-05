@@ -8,7 +8,8 @@ export const SPECIES = [
   { id: 'fish',    label: 'Fish',     unit: 'school', max: 240, def: 90, len: 0.6, bend: [0.09, 9, 15, 0], belly: 0.7 },
   { id: 'shark',   label: 'Sharks',   unit: 'reef',   max: 6,   def: 2,  len: 3.0,  bend: [0.07, 5, 4.5, 0], belly: 1.0 },
   { id: 'turtle',  label: 'Turtles',  unit: 'green',  max: 8,   def: 3,  len: 1.0,  flap: [0.22, 1.8], belly: 0.4 },
-  { id: 'whale',   label: 'Whales',   unit: 'humpback', max: 3, def: 1,  len: 12,   bend: [0.085, 4.2, 1.5, 1], flap: [0.07, 0.75], belly: 1.4 },
+  // whale: bend.w = 2 switches on the spine model; spine = [fluke amplitude, wave number, rigid fraction, fluke flex]
+  { id: 'whale',   label: 'Whales',   unit: 'humpback', max: 3, def: 1,  len: 12,   bend: [0, 0, 0, 2], spine: [0.075, 5.2, 0.22, 1.0], belly: 1.4 },
   { id: 'seal',    label: 'Seals',    unit: 'harbour', max: 8,  def: 3,  len: 1.6,  bend: [0.08, 6, 5, 1], belly: 0.6 },
   { id: 'dolphin', label: 'Dolphins', unit: 'pod',    max: 10,  def: 5,  len: 2.2,  bend: [0.06, 5, 9, 1], belly: 1.1 },
   { id: 'gull',    label: 'Seagulls', unit: 'flock',  max: 24,  def: 8,  len: 0.45, flap: [0.5, 9], belly: 0.05, air: true },
@@ -148,10 +149,58 @@ const GEOMETRY = {
 };
 
 // ---------------------------------------------------------------- shaders
+// Shared vertex deformation. Bodies lie along +z (head +0.5, tail -0.5), y up.
+//  - generic species: travelling sine displacement + wing/flipper flap
+//  - whale (uBend.w = 2): a vertical spine. Cross-sections rotate with the local
+//    slope, so the flukes pitch through each stroke and normals stay correct.
+//    The CPU supplies the stroke: aInst.x = phase, .y = steer (-1..1), .w = stroke strength.
+const DEFORM_GLSL = /* glsl */`
+  uniform vec4 uBend;   // amplitude, spatial freq, speed, mode (0 lateral, 1 vertical, 2 spine)
+  uniform vec2 uFlap;   // amplitude, speed
+  uniform vec4 uSpine;  // fluke amplitude, wave number, rigid fraction, fluke flex
+  uniform float uClock;
+  float spineH(float u, float ph, float amp) {
+    float env = pow(smoothstep(uSpine.z, 1.0, u), 1.45);
+    // small counter-motion of the head: the body pivots about a point ~1/3 back
+    float recoil = -0.12 * max(0.0, 1.0 - u / 0.33) * sin(ph - uSpine.y);
+    return amp * (env * sin(ph - uSpine.y * u) + recoil);
+  }
+  void animalDeform(inout vec3 p, inout vec3 n, float wing, vec4 inst) {
+    if (uBend.w > 1.5) {
+      float u = clamp(0.5 - p.z, 0.0, 1.0);          // 0 rostrum .. 1 fluke tip
+      float ph = inst.x;
+      float amp = uSpine.x * inst.w;
+      // pectoral flippers: held out, used for steering, a slight sway with the stroke
+      float pec = wing * wing * smoothstep(0.12, 0.22, u) * (1.0 - smoothstep(0.5, 0.62, u));
+      p.y += pec * (sign(p.x) * inst.y * 0.05 + 0.01 * sin(ph + 1.2) * inst.w);
+      float h = spineH(u, ph, amp);
+      float e = 0.01;
+      float dhdu = (spineH(u + e, ph, amp) - spineH(u - e, ph, amp)) / (2.0 * e);
+      float th = atan(-dhdu);                          // slope dy/dz of the spine
+      // flukes are flexible: extra pitch that leads the stroke
+      th += uSpine.w * 0.35 * smoothstep(0.84, 0.97, u) * cos(ph - uSpine.y * u) * inst.w;
+      float c = cos(th), sn = sin(th);
+      float yl = p.y;
+      p.y = h + yl * c;
+      p.z = p.z - yl * sn;
+      n = vec3(n.x, n.y * c + n.z * sn, -n.y * sn + n.z * c);
+    } else {
+      float w = smoothstep(0.35, -0.5, p.z);
+      float b = sin(p.z * uBend.y - uClock * uBend.z + inst.x) * uBend.x * (0.12 + w * w * 1.1);
+      if (uBend.w < 0.5) p.x += b; else p.y += b;
+      float fl = sin(uClock * uFlap.y + inst.x) * uFlap.x * inst.y;
+      p.y += wing * wing * fl;
+      p.x *= 1.0 - 0.12 * abs(fl) * wing;
+      n.y += -sign(p.x) * fl * wing * 0.8;
+    }
+  }
+`;
+
 function animalMaterial(common, U, def) {
   const own = {
     uBend: { value: new THREE.Vector4(...(def.bend || [0, 0, 0, 0])) },
     uFlap: { value: new THREE.Vector2(...(def.flap || [0, 0])) },
+    uSpine: { value: new THREE.Vector4(...(def.spine || [0, 0, 0, 0])) },
     uBelly: { value: def.belly },
     uClock: U.uClock,
     uAnimalAbsorb: U.uAnimalAbsorb,
@@ -161,9 +210,7 @@ function animalMaterial(common, U, def) {
     uniforms: { ...U, ...own },
     side: THREE.DoubleSide,
     vertexShader: /* glsl */`
-      uniform vec4 uBend;   // amplitude, spatial freq, speed, axis (0 lateral, 1 vertical)
-      uniform vec2 uFlap;   // amplitude, speed
-      uniform float uClock;
+      ${DEFORM_GLSL}
       attribute vec3 aCol;
       attribute float aWing;
       attribute vec4 aInst; // phase, flap gate, surface height, tint index
@@ -176,14 +223,7 @@ function animalMaterial(common, U, def) {
       void main() {
         vec3 p = position;
         vec3 n = normal;
-        float w = smoothstep(0.35, -0.5, p.z);
-        float b = sin(p.z * uBend.y - uClock * uBend.z + aInst.x) * uBend.x * (0.12 + w * w * 1.1);
-        if (uBend.w < 0.5) p.x += b; else p.y += b;
-        float fl = sin(uClock * uFlap.y + aInst.x) * uFlap.x * aInst.y;
-        float wg = aWing * aWing;
-        p.y += wg * fl;
-        p.x *= 1.0 - 0.12 * abs(fl) * aWing;
-        n.y += -sign(p.x) * fl * aWing * 0.8;
+        animalDeform(p, n, aWing, aInst);
         vec4 wp = modelMatrix * instanceMatrix * vec4(p, 1.0);
         vN = normalize(mat3(modelMatrix * instanceMatrix) * normalize(n));
         vWorld = wp.xyz;
@@ -494,77 +534,183 @@ export function createWildlife({ scene, U, common, seaHeight, getBounds, state, 
     }
   }
 
-  function stepWhale(h, n, b, tau, dt) {
+  // ---- whale: a heavy swimmer steered by heading, not a fixed path.
+  // One stroke clock drives everything: fluke beat (shader), thrust surge,
+  // a slight body pitch. Behaviour cycles cruise → ascend → surface (blows) →
+  // fluke-up dive, with ballistic breaches on demand.
+  const whales = [];
+  const wf = new THREE.Vector3();
+  const angDiff = (a, b) => { let d = (a - b) % TAU; if (d > Math.PI) d -= TAU; if (d < -Math.PI) d += TAU; return d; };
+  const damp = (cur, target, rate, dt) => cur + (target - cur) * (1 - Math.exp(-rate * dt));
+  const clamp = (x, lo, hi) => Math.min(hi, Math.max(lo, x));
+  const BREACH_MODES = ['windup', 'rise', 'air', 'recover'];
+  function whaleMode(w, mode, dur = 0) { w.mode = mode; w.modeT = 0; w.modeDur = dur; }
+  function whaleFwd(w, out) {
+    const cp = Math.cos(w.pitch);
+    return out.set(Math.sin(w.yaw) * cp, Math.sin(w.pitch), Math.cos(w.yaw) * cp);
+  }
+  function whaleBlow(w, L) {
+    whaleFwd(w, wf);
+    const x = w.pos.x + wf.x * L * 0.3, z = w.pos.z + wf.z * L * 0.3;
+    spray.blow(x, seaHeight(x, z) + 0.3, z);
+  }
+
+  function stepWhale(h, n, b, dt) {
+    dt = Math.min(dt, 0.05);
     const L = Math.min(h.len, b.open ? 14 : b.half * 0.55) * state.scale;
-    const A = Math.max(0.5, b.half - L * 0.55);
-    const aux = h.aux;
+    const lim = b.open ? b.half - L : b.half - L * 0.5;
+    const floor = b.open ? -Math.max(b.depth, 30) : -b.depth + L * 0.16;
+    const cruiseY = Math.max(-Math.min(Math.max(b.depth * 0.5, L * 0.3 + 1), 14), floor + L * 0.15);
+    const vCruise = 0.17 * L;          // ~2 m/s for a 12 m humpback
+    const g = 9.81 * (L / 12);         // Froude-scaled so a small column whale keeps real timing
     for (let i = 0; i < n; i++) {
-      h.inst.array[i * 4 + 1] = 1; // pectoral fins sweep
-      const fx = (1.1 / A) * (0.8 + 0.4 * rnd(i, 21));
-      const ph1 = rnd(i, 22) * TAU, ph2 = rnd(i, 23) * TAU;
-      const base = -Math.min(Math.max(b.depth * 0.55, L * 0.22 + 1), 14);
-      const pathAt = (t, out) => out.set(lis(A, fx, ph1, t), base, lis(A * 0.85, fx * 1.31, ph2, t));
-      let roll = 0;
-      const yAt = (t, x, z) => {
-        const surf = seaHeight(x, z);
-        // gentle heave in time with the fluke stroke
-        let y = base + 0.45 * Math.sin(t * 0.9 + ph1) + 0.25 * Math.sin(t * 0.37 + ph2);
-        // routine surfacing to breathe
-        const cyc = (t * 0.024 + rnd(i, 24)) % 1;
-        if (cyc > 0.66 && cyc < 0.95) {
-          const s = (cyc - 0.66) / 0.29;
-          y = y + (surf - L * 0.07 - y) * Math.pow(Math.sin(Math.PI * s), 0.6);
-        }
-        // breach: rise steeply, clear most of the body, twist and fall back
-        const bs = aux[i * 4];
-        if (bs > 0) {
-          const s = (simNow - bs) / aux[i * 4 + 1];
-          if (s >= 0 && s <= 1) {
-            y = y + (surf + L * 0.24 - y) * Math.pow(Math.sin(Math.PI * s), 0.85);
-            roll = Math.PI * 0.85 * Math.sin(Math.PI * s);
+      let w = whales[i];
+      if (!w) {
+        w = whales[i] = {
+          pos: new THREE.Vector3((rnd(i, 21) - 0.5) * lim, cruiseY, (rnd(i, 22) - 0.5) * lim),
+          vel: new THREE.Vector3(), yaw: rnd(i, 23) * TAU, pitch: 0, roll: 0, yawRate: 0,
+          speed: vCruise, phase: rnd(i, 24) * TAU, amp: 1, wander: 0, mode: 'cruise', modeT: 0,
+          modeDur: 10 + 25 * rnd(i, 26), blows: 0, nextBlow: 0, spin: 0, sink: 0, tailUp: 0,
+        };
+        w.wander = w.yaw;
+      }
+      w.modeT += dt;
+      const hard = lim + 0.18 * L;   // steering aims inside lim; this is only a backstop
+      if (!b.open) { w.pos.x = clamp(w.pos.x, -hard, hard); w.pos.z = clamp(w.pos.z, -hard, hard); }
+      const surf = seaHeight(w.pos.x, w.pos.z);
+
+      // --- behaviour: what depth, speed and stroke strength the whale wants
+      let targetY = cruiseY + 0.5 * Math.sin(w.modeT * 0.09 + i * 2.1);
+      let speedT = vCruise, ampT = 1, maxPitch = 0.3, pitchGain = 1, pitchRate = 0.55, yawFree = true;
+      switch (w.mode) {
+        case 'cruise':
+          if (w.modeT > w.modeDur) whaleMode(w, 'ascend');
+          break;
+        case 'ascend':
+          targetY = surf - 0.07 * L; speedT = vCruise * 0.9;
+          if (w.pos.y > surf - 0.15 * L) {
+            whaleMode(w, 'surface'); w.blows = 2 + Math.floor(rnd(i, w.phase) * 2); w.nextBlow = 0.8;
+            spray.emit(w.pos.x, surf, w.pos.z, 40, 2.2, { radius: L * 0.2, size: 0.35 });
           }
+          break;
+        case 'surface':
+          targetY = surf - 0.07 * L; speedT = vCruise * 0.6; ampT = 0.45; pitchGain = 3; maxPitch = 0.1;
+          if (w.modeT > w.nextBlow) {
+            if (w.blows-- > 0) { whaleBlow(w, L); w.nextBlow = w.modeT + 5 + 3 * Math.random(); }
+            else whaleMode(w, 'dive');
+          }
+          break;
+        case 'dive':
+          // fluke-up: tip the head down hard and glide, so the tail lifts clear of the water
+          targetY = floor; speedT = vCruise * 0.75; ampT = w.modeT < 3.5 ? 0.12 : 0.8;
+          maxPitch = 0.9; pitchGain = 6; pitchRate = 0.75;
+          if (w.modeT > 3 && w.pos.y < Math.max(cruiseY, floor + 0.35 * L)) whaleMode(w, 'cruise', 25 + 25 * Math.random());
+          break;
+        case 'windup':
+          targetY = Math.max(floor + 0.1 * L, surf - 1.1 * L); speedT = vCruise * 1.3; ampT = 1; maxPitch = 0.75; pitchGain = 3; pitchRate = 0.9;
+          if (w.pos.y < targetY + 0.15 * L || w.modeT > 6) whaleMode(w, 'rise');
+          break;
+        case 'rise': {
+          const headY = w.pos.y + Math.sin(w.pitch) * 0.45 * L;
+          if (headY > surf && !w.splashed) { w.splashed = true; spray.emit(w.pos.x, surf, w.pos.z, 120, 5, { radius: L * 0.15, size: 0.4 }); }
+          // drive up steeply, accelerating with hard fluke strokes
+          speedT = 0.85 * L; ampT = 1.45; pitchRate = 1.6; yawFree = false;
+          if (w.pos.y > surf - 0.05 * L) {
+            whaleFwd(w, w.vel).multiplyScalar(w.speed);
+            w.spin = (Math.random() < 0.5 ? -1 : 1) * (1.4 + 0.6 * Math.random());
+            whaleMode(w, 'air');
+          } else if (w.modeT > 6) whaleMode(w, 'cruise', 20);
+          break;
         }
-        return y;
-      };
-      pathAt(tau, p1); pathAt(tau + 0.12, p2);
-      p1.y = yAt(tau, p1.x, p1.z);
-      p2.y = yAt(tau + 0.12, p2.x, p2.z);
-      if (!b.open) { p1.y = Math.max(p1.y, -b.depth + L * 0.12); p2.y = Math.max(p2.y, -b.depth + L * 0.12); }
-      vel.subVectors(p2, p1);
-      const breaching = aux[i * 4] > 0 && simNow - aux[i * 4] < aux[i * 4 + 1];
-      if (!breaching) { vel.y *= 0.7; roll = 0.06 * Math.sin(tau * 0.45 + ph1); }
-      const surf = seaHeight(p1.x, p1.z);
-      h.inst.array[i * 4 + 2] = surf;
-      const fwd = vel.clone().normalize();
-      const headY = p1.y + fwd.y * L * 0.45;
-      const above = headY > surf + 0.1 ? 1 : 0;
-      if (above !== h.above[i]) {
-        if (breaching) {
-          spray.bigSplash(p1.x + fwd.x * L * 0.2, surf, p1.z + fwd.z * L * 0.2, L * 0.3);
-          // after falling back, surface and take a breath
-          if (!above) aux[i * 4 + 2] = simNow + 2.2;
-        } else if (above) {
-          spray.emit(p1.x, surf, p1.z, 40, 2.5, { radius: L * 0.2, size: 0.35 });
-          spray.blow(p1.x + fwd.x * L * 0.28, surf + 0.4, p1.z + fwd.z * L * 0.28);
+      }
+
+      if (w.mode === 'air') {
+        // ballistic: gravity only. The body keeps rotating — pitch falls back, it spins onto its side
+        w.vel.y -= g * dt;
+        w.pos.addScaledVector(w.vel, dt);
+        w.pitch -= 0.5 * dt;
+        w.roll = clamp(w.roll + w.spin * dt, -2.3, 2.3);
+        w.amp = damp(w.amp, 0.15, 2, dt);
+        w.phase += TAU * 0.25 * dt;
+        if (w.vel.y < 0 && w.pos.y < seaHeight(w.pos.x, w.pos.z) - 0.04 * L) {
+          whaleFwd(w, wf);
+          spray.bigSplash(w.pos.x, seaHeight(w.pos.x, w.pos.z), w.pos.z, L * 0.35);
+          w.sink = w.vel.y * 0.5;
+          w.speed = Math.hypot(w.vel.x, w.vel.z) * 0.6;
+          w.yaw = Math.atan2(w.vel.x, w.vel.z);
+          whaleMode(w, 'recover');
         }
-        h.above[i] = above;
+      } else {
+        if (w.mode === 'recover') {
+          speedT = vCruise * 0.5; ampT = w.modeT < 1.5 ? 0.2 : 0.7; targetY = surf - 0.3 * L; maxPitch = 0.25;
+          if (w.modeT > 3.4 && w.blows !== -9) { whaleBlow(w, L); w.blows = -9; }
+          if (w.modeT > 7) whaleMode(w, 'cruise', 20 + 20 * Math.random());
+        }
+        // --- heading: slow wander, look-ahead wall avoidance, capped turn rate
+        w.wander += dt * 0.16 * Math.sin(w.modeT * 0.13 + i * 3.7 + w.phase * 0.02);
+        let desired = w.wander;
+        const look = L * 0.45 + w.speed * 3;
+        const ax = w.pos.x + Math.sin(w.yaw) * look, az = w.pos.z + Math.cos(w.yaw) * look;
+        const over = b.open ? Math.hypot(ax, az) - lim : Math.max(Math.abs(ax), Math.abs(az)) - lim;
+        if (over > 0) {
+          // ease toward the middle; the closer the wall, the stronger the pull
+          const home = Math.atan2(-w.pos.x, -w.pos.z);
+          desired = w.yaw + angDiff(home, w.yaw) * clamp(over / (0.3 * L), 0.35, 1);
+          w.wander = damp(w.wander, w.yaw + angDiff(home, w.yaw), 0.5, dt);
+        }
+        const maxTurn = clamp(w.speed / (0.85 * L), 0.05, 0.5);
+        const yawT = yawFree ? clamp(angDiff(desired, w.yaw) * (over > 0 ? 0.8 : 0.45), -maxTurn, maxTurn) : 0;
+        w.yawRate = damp(w.yawRate, yawT, 0.9, dt);
+        w.yaw += w.yawRate * dt;
+        // --- pitch follows the climb; the body always points where it travels
+        const pitchT = w.mode === 'rise' ? 1.2 : clamp((targetY - w.pos.y) / L * 0.9 * pitchGain, -maxPitch, maxPitch);
+        w.pitch = damp(w.pitch, w.pos.y < floor + 0.05 * L ? Math.max(pitchT, 0.15) : pitchT, pitchRate, dt);
+        // --- bank into turns, settle back after the breach spin
+        const rollT = clamp(-w.yawRate * 1.5, -0.28, 0.28);
+        w.roll = damp(w.roll, rollT, w.mode === 'recover' ? 0.5 : 0.8, dt);
+        // --- one stroke clock: frequency follows speed (Strouhal-like), thrust surges twice per beat
+        w.speed = damp(w.speed, speedT, w.mode === 'rise' ? 1.8 : 0.35, dt);
+        w.amp = damp(w.amp, ampT, 1.2, dt);
+        const freq = clamp(w.speed / (0.6 * L), 0.12, 0.85) * (0.55 + 0.45 * Math.min(w.amp, 1));
+        w.phase += TAU * freq * dt;
+        const surge = 1 + 0.05 * w.amp * Math.sin(2 * w.phase);
+        whaleFwd(w, wf);
+        w.pos.addScaledVector(wf, w.speed * surge * dt);
+        if (w.mode === 'recover') { w.pos.y += w.sink * dt; w.sink = damp(w.sink, 0, 1.4, dt); }
+        w.pos.y = Math.max(w.pos.y, floor);
+        if (!['rise', 'recover'].includes(w.mode)) w.pos.y = Math.min(w.pos.y, surf - 0.04 * L);
       }
-      // the breath after a breach
-      if (aux[i * 4 + 2] > 0 && simNow >= aux[i * 4 + 2]) {
-        aux[i * 4 + 2] = 0;
-        spray.blow(p1.x + fwd.x * L * 0.28, surf + 0.4, p1.z + fwd.z * L * 0.28);
+
+      // --- surface interactions
+      whaleFwd(w, wf);
+      const surfNow = seaHeight(w.pos.x, w.pos.z);
+      const tailY = w.pos.y - wf.y * 0.48 * L;
+      const tailUp = tailY > surfNow + 0.05 ? 1 : 0;
+      if (tailUp !== w.tailUp && w.mode === 'dive') {
+        const tx = w.pos.x - wf.x * 0.48 * L, tz = w.pos.z - wf.z * 0.48 * L;
+        spray.emit(tx, surfNow, tz, tailUp ? 50 : 70, tailUp ? 1.6 : 2.4, { radius: L * 0.12, size: 0.3, life: 1.6 });
       }
-      if (aux[i * 4] > 0 && simNow - aux[i * 4] > aux[i * 4 + 1]) aux[i * 4] = 0;
-      place(h, i, p1, vel, L, roll);
+      w.tailUp = tailUp;
+
+      h.inst.array[i * 4] = w.phase;
+      h.inst.array[i * 4 + 1] = clamp(-w.yawRate / 0.3, -1, 1);
+      h.inst.array[i * 4 + 2] = surfNow;
+      h.inst.array[i * 4 + 3] = w.amp;
+      // a faint pitching of the whole body in time with the stroke
+      const pitchSave = w.pitch;
+      w.pitch += 0.015 * w.amp * Math.cos(w.phase);
+      whaleFwd(w, wf);
+      w.pitch = pitchSave;
+      place(h, i, w.pos, wf, L, w.roll);
     }
     // occasional breaches on their own
-    if (n && Math.random() < dt * 0.012 * state.activity) breach();
+    if (n && Math.random() < dt * 0.005) breach();
   }
   function breach() {
-    const h = herds.whale;
     const n = state.on.whale ? state.n.whale : 0;
     for (let i = 0; i < n; i++) {
-      if (h.aux[i * 4] === 0) { h.aux[i * 4] = simNow; h.aux[i * 4 + 1] = 5.5 / Math.sqrt(Math.max(state.activity, 0.3)); return true; }
+      const w = whales[i];
+      if (w && !BREACH_MODES.includes(w.mode)) { whaleMode(w, 'windup'); w.blows = 0; w.splashed = false; return true; }
     }
     return false;
   }
@@ -647,6 +793,26 @@ export function createWildlife({ scene, U, common, seaHeight, getBounds, state, 
   const SURFACE = { fish: [0.28, 0.3], shark: [0.5, 0.0], dolphin: [0.3, 0.0], whale: [0.42, 0.0], seal: [0.36, 0.0], turtle: [0.6, 0.0], gull: [0.85, 0.0], pelican: [0.85, 0.0] };
   // set to -1 for any model that comes out tail-first
   const FLIP = {};
+  // The generated humpback holds its pectoral flippers ~40° below horizontal, like
+  // landing gear. Rotate them up about their root so they ride out to the sides.
+  function liftFlippers(g) {
+    const P = g.attributes.position, N = g.attributes.normal;
+    const rootX = 0.085, rootY = -0.03, lift = 0.5;
+    for (let i = 0; i < P.count; i++) {
+      const x = P.getX(i), y = P.getY(i), u = 0.5 - P.getZ(i);
+      const dx = Math.abs(x) - rootX, dy = y - rootY;
+      if (dx <= 0 || dy > 0.02 || u < 0.2 || u > 0.54) continue;
+      const wgt = smooth(0.02, 0.1, Math.hypot(dx, dy)) * smooth(0.2, 0.27, u) * (1 - smooth(0.47, 0.54, u));
+      if (!wgt) continue;
+      const a = lift * wgt, c = Math.cos(a), sn = Math.sin(a), sg = Math.sign(x);
+      P.setXY(i, sg * (rootX + dx * c - dy * sn), rootY + dx * sn + dy * c);
+      if (N) {
+        const nx = N.getX(i) * sg, ny = N.getY(i);
+        N.setXY(i, sg * (nx * c - ny * sn), nx * sn + ny * c);
+      }
+    }
+    P.needsUpdate = true; if (N) N.needsUpdate = true;
+  }
   function adopt(def, gltf) {
     const h = herds[def.id];
     gltf.scene.updateMatrixWorld(true);
@@ -674,6 +840,7 @@ export function createWildlife({ scene, U, common, seaHeight, getBounds, state, 
     const k = 1 / Math.max(size.z, 1e-6);
     g.scale(k, k, k);
     if (!g.attributes.normal) g.computeVertexNormals();
+    if (def.id === 'whale') liftFlippers(g);
     const halfSpan = (size.x * k) / 2, bodyHalf = def.id === 'turtle' ? 0.36 : def.id === 'whale' ? 0.08 : 0.12;
     const wing = new Float32Array(P.count);
     if (winged || def.id === 'whale') for (let i = 0; i < P.count; i++) wing[i] = Math.min(1, Math.max(0, (Math.abs(P.getX(i)) - bodyHalf) / Math.max(halfSpan - bodyHalf, 0.05)));
@@ -692,19 +859,19 @@ export function createWildlife({ scene, U, common, seaHeight, getBounds, state, 
     if (mat.map) mat.map.colorSpace = THREE.SRGBColorSpace;
     const uni = h.mesh.material.uniforms;
     mat.onBeforeCompile = (sh) => {
-      Object.assign(sh.uniforms, { uBend: uni.uBend, uFlap: uni.uFlap, uClock: U.uClock, uAnimalAbsorb: U.uAnimalAbsorb, uOpen: U.uOpen, uWaterCol: U.uWaterCol });
+      Object.assign(sh.uniforms, { uBend: uni.uBend, uFlap: uni.uFlap, uSpine: uni.uSpine, uClock: U.uClock, uAnimalAbsorb: U.uAnimalAbsorb, uOpen: U.uOpen, uWaterCol: U.uWaterCol });
       sh.vertexShader = sh.vertexShader
         .replace('#include <common>', `#include <common>
           attribute vec4 aInst; attribute float aWing; attribute vec3 aTint;
-          uniform vec4 uBend; uniform vec2 uFlap; uniform float uClock;
+          ${DEFORM_GLSL}
           varying vec3 vWorldW; varying float vSurfW; varying vec3 vTintW;`)
-        .replace('#include <begin_vertex>', `vec3 transformed = vec3(position);
-          float bw = smoothstep(0.35, -0.5, transformed.z);
-          float bb = sin(transformed.z * uBend.y - uClock * uBend.z + aInst.x) * uBend.x * (0.12 + bw * bw * 1.1);
-          if (uBend.w < 0.5) transformed.x += bb; else transformed.y += bb;
-          float fl = sin(uClock * uFlap.y + aInst.x) * uFlap.x * aInst.y;
-          transformed.y += aWing * aWing * fl;
-          transformed.x *= 1.0 - 0.1 * abs(fl) * aWing;`)
+        .replace('#include <beginnormal_vertex>', `vec3 objectNormal = vec3(normal);
+          vec3 animP = vec3(position);
+          animalDeform(animP, objectNormal, aWing, aInst);
+          #ifdef USE_TANGENT
+            vec3 objectTangent = vec3(tangent.xyz);
+          #endif`)
+        .replace('#include <begin_vertex>', `vec3 transformed = animP;`)
         .replace('#include <project_vertex>', `#include <project_vertex>
           vWorldW = (modelMatrix * instanceMatrix * vec4(transformed, 1.0)).xyz;
           vSurfW = aInst.z; vTintW = aTint;`);
@@ -779,7 +946,7 @@ export function createWildlife({ scene, U, common, seaHeight, getBounds, state, 
           for (let i = 0; i < n; i++) h.inst.array[i * 4 + 1] = 1;
           cruise(h, n, b, tau, 0.55, 0.22, 1.4, 7, 0.8, (i) => ({ roll: 0.15 * Math.sin(tau * 0.6 + i), below: 0.6 }));
           break;
-        case 'whale': stepWhale(h, n, b, tau, a); break;
+        case 'whale': stepWhale(h, n, b, a); break;
         case 'seal':
           cruise(h, n, b, tau, 1.6, 0.06, 0.7, 1.6, 0.5, (i) => ({ roll: 1.3 * Math.sin(tau * 0.55 + i * 1.7), below: 0.35 }));
           break;
@@ -802,5 +969,6 @@ export function createWildlife({ scene, U, common, seaHeight, getBounds, state, 
     leap: () => { events.leap = true; },
     flyover: () => { events.flyover = true; },
     blow: (x, y, z) => spray.blow(x, y, z),
+    whales,
   };
 }
